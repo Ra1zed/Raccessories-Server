@@ -30,9 +30,10 @@ import java.util.regex.Pattern;
  *       (or set the PORT / CAPE_DATA / CAPE_IMAGES environment variables, as cloud hosts do)
  *
  * API
- *   GET  /capes?uuids=<uuid>,<uuid>,...   -> {"<uuid>":"<loadout>", ...}   (players wearing nothing are left out)
- *   POST /capes  {"uuid":"..","name":"..","serverId":"..","cosmetic":"<id>.<id>..."}  -> 204, or 400/401
- *   POST /custom?uuid=..&name=..&serverId=..   body: cape texture PNG  -> 200 "<hash>", or 400/401/413
+ *   GET  /capes?uuids=<uuid>,...&names=<name>,...   -> {"<uuid>":"<loadout>", "<lowercase name>":"<loadout>", ...}
+ *        (players wearing nothing are left out)
+ *   POST /capes  {"uuid":"..","name":"..","serverId":"..","token":"..","cosmetic":"<id>.<id>..."}  -> 204, or 400/401
+ *   POST /custom?uuid=..&name=..&serverId=..&token=..   body: cape texture PNG  -> 200 "<hash>", or 400/401/413
  *   GET  /custom/<hash>.png  (or HEAD)  -> the PNG, or 404
  *   GET  /health -> ok
  *
@@ -45,12 +46,21 @@ import java.util.regex.Pattern;
  * (exactly like joining a Minecraft server). This server then asks Mojang's hasJoined endpoint who
  * that was, so a player can only ever change their own cape. --no-auth skips this for local testing
  * with offline/dev accounts; never use it on a public server.
+ *
+ * Offline-mode ("cracked") servers give players offline UUIDs made from their name, so loadouts are also
+ * stored by name, and clients look players up by name there. Players Mojang can't vouch for (cracked
+ * launchers) can still upload, but only under their name: the first upload claims the name with the
+ * client's secret token, and later uploads must bring the same token. Once a name's real (premium) owner
+ * uploads with Mojang's check, the name is theirs and offline uploads for it are refused.
  */
 public class CapeServer {
     private static final Pattern UUID_PATTERN = Pattern.compile("^[0-9a-f]{32}$");
     // a loadout: up to 256 chars of cosmetic ids joined with '.' (one id per slot: back, head, body, legs, effect)
     private static final Pattern COSMETIC_PATTERN = Pattern.compile("^(?=.{0,256}$)([a-z0-9_]{1,64}([.][a-z0-9_]{1,64})*)?$");
     private static final Pattern NAME_PATTERN = Pattern.compile("^[A-Za-z0-9_]{1,16}$");
+    private static final Pattern TOKEN_PATTERN = Pattern.compile("^[0-9a-f]{32,64}$");
+    /** In NAME_TOKENS: the name's premium owner uploaded, so offline uploads can't use it. */
+    private static final String PREMIUM = "premium";
     private static final int MAX_LOOKUP = 200;
     private static final Pattern IMAGE_PATH = Pattern.compile("^/custom/([0-9a-f]{16})\\.png$");
     // must match the mod (CustomCapes): textures up to 4 MB, 128/256/512 px wide, at most 128 frames
@@ -58,10 +68,13 @@ public class CapeServer {
     private static final int MAX_FRAMES = 128;
 
     private static final Map<String, String> CAPES = new ConcurrentHashMap<>();
-    /** uuid -> hash of that player's custom cape picture */
+    /** uuid (or lowercase name, for offline players) -> hash of that player's custom cape picture */
     private static final Map<String, String> OWNERS = new ConcurrentHashMap<>();
+    /** lowercase name -> SHA-256 of the token that claimed it for offline uploads, or PREMIUM */
+    private static final Map<String, String> NAME_TOKENS = new ConcurrentHashMap<>();
     private static final HttpClient HTTP = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
     private static Path dataFile;
+    private static Path tokenFile;
     private static Path imageDir;
     private static boolean requireAuth = true;
 
@@ -79,7 +92,9 @@ public class CapeServer {
                 default -> throw new IllegalArgumentException("Unknown argument " + args[i]);
             }
         }
-        load();
+        tokenFile = dataFile.resolveSibling("name-tokens.properties");
+        load(dataFile, CAPES);
+        load(tokenFile, NAME_TOKENS);
         Files.createDirectories(imageDir);
         loadOwners();
 
@@ -107,21 +122,20 @@ public class CapeServer {
     }
 
     private static void lookup(HttpExchange ex) throws IOException {
-        String query = ex.getRequestURI().getRawQuery();
-        String list = "";
-        if (query != null)
-            for (String part : query.split("&"))
-                if (part.startsWith("uuids=")) list = part.substring(6);
+        Map<String, String> query = parseQuery(ex.getRequestURI().getRawQuery());
         StringBuilder json = new StringBuilder("{");
         int count = 0;
-        for (String raw : list.split(",")) {
+        // uuids are 32 hex digits and names at most 16 characters, so the two kinds of keys never clash
+        for (String raw : (query.getOrDefault("uuids", "") + "," + query.getOrDefault("names", "")).split(",")) {
+            if (raw.isEmpty()) continue;
             if (++count > MAX_LOOKUP) break;
-            String uuid = normalizeUuid(raw);
-            if (uuid == null) continue;
-            String cape = CAPES.get(uuid);
+            String key = normalizeUuid(raw);
+            if (key == null && NAME_PATTERN.matcher(raw).matches()) key = raw.toLowerCase();
+            if (key == null) continue;
+            String cape = CAPES.get(key);
             if (cape == null || cape.isEmpty()) continue;
             if (json.length() > 1) json.append(',');
-            json.append('"').append(uuid).append("\":\"").append(cape).append('"');
+            json.append('"').append(key).append("\":\"").append(cape).append('"');
         }
         respond(ex, 200, json.append('}').toString(), "application/json");
     }
@@ -146,19 +160,27 @@ public class CapeServer {
         String uuid = normalizeUuid(json.getOrDefault("uuid", ""));
         String name = json.getOrDefault("name", "");
         String serverId = json.getOrDefault("serverId", "");
+        String token = json.getOrDefault("token", "");
         String cosmetic = json.getOrDefault("cosmetic", "");
         if (uuid == null || !NAME_PATTERN.matcher(name).matches() || !COSMETIC_PATTERN.matcher(cosmetic).matches()) {
             respond(ex, 400, "bad request", "text/plain");
             return;
         }
-        if (requireAuth && !verifyWithMojang(name, serverId, uuid)) {
+        Auth auth = authorize(name, serverId, uuid, token);
+        if (auth == Auth.DENIED) {
             respond(ex, 401, "not authenticated", "text/plain");
             return;
         }
-        if (cosmetic.isEmpty()) CAPES.remove(uuid);
-        else CAPES.put(uuid, cosmetic);
+        // by name for offline-mode servers; by uuid only when Mojang confirmed it's really theirs
+        String nameKey = name.toLowerCase();
+        if (cosmetic.isEmpty()) CAPES.remove(nameKey);
+        else CAPES.put(nameKey, cosmetic);
+        if (auth == Auth.PREMIUM) {
+            if (cosmetic.isEmpty()) CAPES.remove(uuid);
+            else CAPES.put(uuid, cosmetic);
+        }
         save();
-        System.out.println(name + " (" + uuid + ") -> " + (cosmetic.isEmpty() ? "no cape" : cosmetic));
+        System.out.println(name + " (" + (auth == Auth.PREMIUM ? uuid : "offline") + ") -> " + (cosmetic.isEmpty() ? "no cape" : cosmetic));
         respond(ex, 204, "", "text/plain");
     }
 
@@ -225,10 +247,12 @@ public class CapeServer {
             respond(ex, 400, "not a cape texture", "text/plain");
             return;
         }
-        if (requireAuth && !verifyWithMojang(name, serverId, uuid)) {
+        Auth auth = authorize(name, serverId, uuid, query.getOrDefault("token", ""));
+        if (auth == Auth.DENIED) {
             respond(ex, 401, "not authenticated", "text/plain");
             return;
         }
+        String owner = auth == Auth.PREMIUM ? uuid : name.toLowerCase();
         String hash = sha256(png).substring(0, 16);
         Path file = imageDir.resolve(hash + ".png");
         if (!Files.exists(file)) {
@@ -237,12 +261,12 @@ public class CapeServer {
             Files.move(tmp, file, java.nio.file.StandardCopyOption.REPLACE_EXISTING, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
         }
         synchronized (OWNERS) {
-            String old = OWNERS.put(uuid, hash);
+            String old = OWNERS.put(owner, hash);
             if (old != null && !old.equals(hash) && !OWNERS.containsValue(old))
                 Files.deleteIfExists(imageDir.resolve(old + ".png"));
             saveOwners();
         }
-        System.out.println(name + " (" + uuid + ") -> custom cape picture " + hash + " (" + png.length / 1024 + " KB)");
+        System.out.println(name + " (" + (auth == Auth.PREMIUM ? uuid : "offline") + ") -> custom cape picture " + hash + " (" + png.length / 1024 + " KB)");
         respond(ex, 200, hash, "text/plain");
     }
 
@@ -276,6 +300,30 @@ public class CapeServer {
                     map.putIfAbsent(part.substring(0, eq), java.net.URLDecoder.decode(part.substring(eq + 1), StandardCharsets.UTF_8));
             }
         return map;
+    }
+
+    private enum Auth { PREMIUM, OFFLINE, DENIED }
+
+    /**
+     * PREMIUM: Mojang confirmed this is the account with this uuid (it then owns the name too).
+     * OFFLINE: an unverified player who holds the name's token (or claims a free name with it); may only use the name.
+     */
+    private static Auth authorize(String name, String serverId, String uuid, String token) throws IOException, InterruptedException {
+        if (!requireAuth) return Auth.PREMIUM;
+        String nameKey = name.toLowerCase();
+        if (verifyWithMojang(name, serverId, uuid)) {
+            if (!PREMIUM.equals(NAME_TOKENS.put(nameKey, PREMIUM))) saveTokens();
+            return Auth.PREMIUM;
+        }
+        if (!TOKEN_PATTERN.matcher(token).matches()) return Auth.DENIED;
+        String tokenHash = sha256(token.getBytes(StandardCharsets.UTF_8));
+        String claimed = NAME_TOKENS.putIfAbsent(nameKey, tokenHash);
+        if (claimed == null) {
+            saveTokens();
+            System.out.println(name + " claimed their name for offline uploads");
+            return Auth.OFFLINE;
+        }
+        return claimed.equals(tokenHash) ? Auth.OFFLINE : Auth.DENIED;
     }
 
     /** Asks Mojang whether this player really just called joinServer with this serverId. */
@@ -315,13 +363,23 @@ public class CapeServer {
         ex.close();
     }
 
-    private static void load() throws IOException {
-        if (!Files.exists(dataFile)) return;
+    private static void load(Path file, Map<String, String> into) throws IOException {
+        if (!Files.exists(file)) return;
         Properties p = new Properties();
-        try (InputStream in = Files.newInputStream(dataFile)) {
+        try (InputStream in = Files.newInputStream(file)) {
             p.load(in);
         }
-        p.forEach((k, v) -> CAPES.put((String) k, (String) v));
+        p.forEach((k, v) -> into.put((String) k, (String) v));
+    }
+
+    private static synchronized void saveTokens() throws IOException {
+        Properties p = new Properties();
+        p.putAll(NAME_TOKENS);
+        Path tmp = tokenFile.resolveSibling(tokenFile.getFileName() + ".tmp");
+        try (OutputStream out = Files.newOutputStream(tmp)) {
+            p.store(out, "lowercase name=sha256 of the token that may upload for it offline, or premium");
+        }
+        Files.move(tmp, tokenFile, java.nio.file.StandardCopyOption.REPLACE_EXISTING, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
     }
 
     private static void loadOwners() throws IOException {
@@ -350,7 +408,7 @@ public class CapeServer {
         p.putAll(CAPES);
         Path tmp = dataFile.resolveSibling(dataFile.getFileName() + ".tmp");
         try (OutputStream out = Files.newOutputStream(tmp)) {
-            p.store(out, "uuid=cosmetic");
+            p.store(out, "uuid or lowercase name=cosmetic");
         }
         Files.move(tmp, dataFile, java.nio.file.StandardCopyOption.REPLACE_EXISTING, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
     }
