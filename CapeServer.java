@@ -35,9 +35,9 @@ import java.util.regex.Pattern;
  *   POST /capes  {"uuid":"..","name":"..","serverId":"..","token":"..","cosmetic":"<id>.<id>..."}  -> 204, or 400/401
  *   POST /custom?uuid=..&name=..&serverId=..&token=..   body: cape texture PNG  -> 200 "<hash>", or 400/401/413
  *   GET  /custom/<hash>.png  (or HEAD)  -> the PNG, or 404
- *   GET  /markers?group=<64 hex>  -> [{"id":"..","dim":"..","x":..,"y":..,"z":..,"tx":..,"tz":..,"type":"..","owner":".."}, ...]
+ *   GET  /markers?group=<64 hex>  -> [{"id":"..","dim":"..","x":..,"y":..,"z":..,"tx":..,"tz":..,"type":"..","owner":"..","icon":"..","expires":..}, ...]
  *   POST /markers  {"uuid","name","serverId","token","group","action":"put|remove|clear",
- *                   "id","dim","x","y","z","tx","tz","type"}  -> 204, or 400/401/403  (tx/tz optional)
+ *                   "id","dim","x","y","z","tx","tz","type","icon","expires"}  -> 204, or 400/401/403  (tx/tz/icon/expires optional)
  *   GET  /health -> ok
  *
  * Custom capes are pictures players made into capes. They are stored by the first 16 hex digits of
@@ -80,6 +80,9 @@ public class CapeServer {
     private static final Pattern DIM_PATTERN = Pattern.compile("^[a-z0-9_.-]{1,64}:[a-z0-9_./-]{1,63}$");
     private static final Pattern TYPE_PATTERN = Pattern.compile("^[a-z_]{1,16}$");
     private static final Pattern INT_PATTERN = Pattern.compile("^-?[0-9]{1,8}$");
+    // what a marker was put on: an item, a creature or a player's head (must match the mod's Marker)
+    private static final Pattern EXPIRES_PATTERN = Pattern.compile("^[0-9]{1,15}$");
+    private static final Pattern ICON_PATTERN =Pattern.compile("^(?=.{1,128}$)((item|entity):[a-z0-9_.-]+:[a-z0-9_./-]+|head:[A-Za-z0-9_]{1,16})$");
     // must match the mod (MarkerServer): per team, and per player in a team
     private static final int MAX_MARKERS_PER_GROUP = 64;
     private static final int MAX_MARKERS_PER_OWNER = 16;
@@ -90,12 +93,16 @@ public class CapeServer {
     /** group -> marker id -> marker, oldest first; guarded by itself */
     private static final Map<String, LinkedHashMap<String, StoredMarker>> MARKERS = new LinkedHashMap<>();
 
-    /** (tx, tz): where an attack arrow points; the marker's own spot for other kinds */
-    private record StoredMarker(String id, String dim, int x, int y, int z, int tx, int tz, String type, String owner, long time) {
+    /** (tx, tz): where an attack arrow points; the marker's own spot for other kinds. icon: what it marks, or "" */
+    /** expires: when a temporary marker disappears (epoch ms), 0 for one that stays */
+    private record StoredMarker(String id, String dim, int x, int y, int z, int tx, int tz, String type, String owner,
+                                String icon, long expires, long time) {
         String toJson() {
             // every field was checked against a pattern, so nothing needs escaping
             return "{\"id\":\"" + id + "\",\"dim\":\"" + dim + "\",\"x\":" + x + ",\"y\":" + y + ",\"z\":" + z
-                    + ",\"tx\":" + tx + ",\"tz\":" + tz + ",\"type\":\"" + type + "\",\"owner\":\"" + owner + "\"}";
+                    + ",\"tx\":" + tx + ",\"tz\":" + tz + ",\"type\":\"" + type + "\",\"owner\":\"" + owner + "\""
+                    + (icon.isEmpty() ? "" : ",\"icon\":\"" + icon + "\"")
+                    + (expires == 0 ? "" : ",\"expires\":" + expires) + "}";
         }
     }
     /** uuid (or lowercase name, for offline players) -> hash of that player's custom cape picture */
@@ -282,14 +289,18 @@ public class CapeServer {
             String x = json.getOrDefault("x", ""), y = json.getOrDefault("y", ""), z = json.getOrDefault("z", "");
             // older mods send no target: the marker points at itself
             String tx = json.getOrDefault("tx", x), tz = json.getOrDefault("tz", z);
+            String icon = json.getOrDefault("icon", "");
+            String expires = json.getOrDefault("expires", "0");
             if (!DIM_PATTERN.matcher(dim).matches() || !TYPE_PATTERN.matcher(type).matches()
                     || !INT_PATTERN.matcher(x).matches() || !INT_PATTERN.matcher(y).matches() || !INT_PATTERN.matcher(z).matches()
-                    || !INT_PATTERN.matcher(tx).matches() || !INT_PATTERN.matcher(tz).matches()) {
+                    || !INT_PATTERN.matcher(tx).matches() || !INT_PATTERN.matcher(tz).matches()
+                    || !icon.isEmpty() && !ICON_PATTERN.matcher(icon).matches()
+                    || !EXPIRES_PATTERN.matcher(expires).matches()) {
                 respond(ex, 400, "bad request", "text/plain");
                 return;
             }
             marker = new StoredMarker(id, dim, Integer.parseInt(x), Integer.parseInt(y), Integer.parseInt(z),
-                    Integer.parseInt(tx), Integer.parseInt(tz), type, name, System.currentTimeMillis());
+                    Integer.parseInt(tx), Integer.parseInt(tz), type, name, icon, Long.parseLong(expires), System.currentTimeMillis());
         }
         if (authorize(name, json.getOrDefault("serverId", ""), uuid, json.getOrDefault("token", "")) == Auth.DENIED) {
             respond(ex, 401, "not authenticated", "text/plain");
@@ -341,11 +352,11 @@ public class CapeServer {
         }
     }
 
-    /** Forgets markers nobody re-sent for MARKER_TTL_MS. Call while holding MARKERS. */
+    /** Forgets markers nobody re-sent for MARKER_TTL_MS, and temporary ones that ran out. Call while holding MARKERS. */
     private static void expireMarkers() {
-        long cutoff = System.currentTimeMillis() - MARKER_TTL_MS;
+        long now = System.currentTimeMillis(), cutoff = now - MARKER_TTL_MS;
         MARKERS.values().removeIf(markers -> {
-            markers.values().removeIf(m -> m.time() < cutoff);
+            markers.values().removeIf(m -> m.time() < cutoff || m.expires() != 0 && m.expires() <= now);
             return markers.isEmpty();
         });
     }
