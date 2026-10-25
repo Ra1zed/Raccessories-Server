@@ -35,6 +35,9 @@ import java.util.regex.Pattern;
  *   POST /capes  {"uuid":"..","name":"..","serverId":"..","token":"..","cosmetic":"<id>.<id>..."}  -> 204, or 400/401
  *   POST /custom?uuid=..&name=..&serverId=..&token=..   body: cape texture PNG  -> 200 "<hash>", or 400/401/413
  *   GET  /custom/<hash>.png  (or HEAD)  -> the PNG, or 404
+ *   GET  /markers?group=<64 hex>  -> [{"id":"..","dim":"..","x":..,"y":..,"z":..,"type":"..","owner":".."}, ...]
+ *   POST /markers  {"uuid","name","serverId","token","group","action":"put|remove|clear",
+ *                   "id","dim","x","y","z","type"}  -> 204, or 400/401/403
  *   GET  /health -> ok
  *
  * Custom capes are pictures players made into capes. They are stored by the first 16 hex digits of
@@ -52,6 +55,12 @@ import java.util.regex.Pattern;
  * launchers) can still upload, but only under their name: the first upload claims the name with the
  * client's secret token, and later uploads must bring the same token. Once a name's real (premium) owner
  * uploads with Mojang's check, the name is theirs and offline uploads for it are refused.
+ *
+ * Map markers: on Minecraft servers without the mod, players share world map markers with their scoreboard
+ * team through here. A "group" is a hash the clients make from the server address and the team name, so this
+ * server never learns either. Markers are kept in memory only, for MARKER_TTL_MS after their last upload; players
+ * re-send theirs when they notice they are gone. Uploads are authenticated like capes, so the owner name shown to
+ * the team is real, and only the owner can move or remove a marker.
  */
 public class CapeServer {
     private static final Pattern UUID_PATTERN = Pattern.compile("^[0-9a-f]{32}$");
@@ -67,7 +76,27 @@ public class CapeServer {
     private static final int MAX_IMAGE_BYTES = 4 << 20;
     private static final int MAX_FRAMES = 128;
 
+    private static final Pattern GROUP_PATTERN = Pattern.compile("^[0-9a-f]{64}$");
+    private static final Pattern DIM_PATTERN = Pattern.compile("^[a-z0-9_.-]{1,64}:[a-z0-9_./-]{1,63}$");
+    private static final Pattern TYPE_PATTERN = Pattern.compile("^[a-z_]{1,16}$");
+    private static final Pattern INT_PATTERN = Pattern.compile("^-?[0-9]{1,8}$");
+    // must match the mod (MarkerServer): per team, and per player in a team
+    private static final int MAX_MARKERS_PER_GROUP = 64;
+    private static final int MAX_MARKERS_PER_OWNER = 16;
+    private static final int MAX_GROUPS = 20_000;
+    private static final long MARKER_TTL_MS = 12 * 60 * 60_000L;
+
     private static final Map<String, String> CAPES = new ConcurrentHashMap<>();
+    /** group -> marker id -> marker, oldest first; guarded by itself */
+    private static final Map<String, LinkedHashMap<String, StoredMarker>> MARKERS = new LinkedHashMap<>();
+
+    private record StoredMarker(String id, String dim, int x, int y, int z, String type, String owner, long time) {
+        String toJson() {
+            // every field was checked against a pattern, so nothing needs escaping
+            return "{\"id\":\"" + id + "\",\"dim\":\"" + dim + "\",\"x\":" + x + ",\"y\":" + y + ",\"z\":" + z
+                    + ",\"type\":\"" + type + "\",\"owner\":\"" + owner + "\"}";
+        }
+    }
     /** uuid (or lowercase name, for offline players) -> hash of that player's custom cape picture */
     private static final Map<String, String> OWNERS = new ConcurrentHashMap<>();
     /** lowercase name -> SHA-256 of the token that claimed it for offline uploads, or PREMIUM */
@@ -101,6 +130,7 @@ public class CapeServer {
         HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
         server.createContext("/capes", CapeServer::handleCapes);
         server.createContext("/custom", CapeServer::handleCustom);
+        server.createContext("/markers", CapeServer::handleMarkers);
         server.createContext("/health", ex -> respond(ex, 200, "ok", "text/plain"));
         server.setExecutor(Executors.newFixedThreadPool(8));
         server.start();
@@ -182,6 +212,138 @@ public class CapeServer {
         save();
         System.out.println(name + " (" + (auth == Auth.PREMIUM ? uuid : "offline") + ") -> " + (cosmetic.isEmpty() ? "no cape" : cosmetic));
         respond(ex, 204, "", "text/plain");
+    }
+
+    private static void handleMarkers(HttpExchange ex) throws IOException {
+        try {
+            switch (ex.getRequestMethod()) {
+                case "GET" -> listMarkers(ex);
+                case "POST" -> changeMarkers(ex);
+                default -> respond(ex, 405, "method not allowed", "text/plain");
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+            respond(ex, 500, "error", "text/plain");
+        }
+    }
+
+    private static void listMarkers(HttpExchange ex) throws IOException {
+        String group = parseQuery(ex.getRequestURI().getRawQuery()).getOrDefault("group", "");
+        if (!GROUP_PATTERN.matcher(group).matches()) {
+            respond(ex, 400, "bad request", "text/plain");
+            return;
+        }
+        StringBuilder json = new StringBuilder("[");
+        synchronized (MARKERS) {
+            expireMarkers();
+            LinkedHashMap<String, StoredMarker> markers = MARKERS.get(group);
+            if (markers != null)
+                for (StoredMarker m : markers.values()) {
+                    if (json.length() > 1) json.append(',');
+                    json.append(m.toJson());
+                }
+        }
+        respond(ex, 200, json.append(']').toString(), "application/json");
+    }
+
+    private static void changeMarkers(HttpExchange ex) throws IOException, InterruptedException {
+        String lengthHeader = ex.getRequestHeaders().getFirst("Content-Length");
+        int length;
+        try {
+            length = lengthHeader == null ? -1 : Integer.parseInt(lengthHeader.trim());
+        } catch (NumberFormatException e) {
+            length = -1;
+        }
+        if (length < 0 || length > 2048) {
+            respond(ex, 400, "bad request", "text/plain");
+            return;
+        }
+        String body;
+        try (InputStream in = ex.getRequestBody()) {
+            body = new String(in.readNBytes(length), StandardCharsets.UTF_8);
+        }
+        Map<String, String> json = parseFlatJson(body);
+        String uuid = normalizeUuid(json.getOrDefault("uuid", ""));
+        String name = json.getOrDefault("name", "");
+        String group = json.getOrDefault("group", "");
+        String action = json.getOrDefault("action", "");
+        String id = json.getOrDefault("id", "");
+        boolean idNeeded = !action.equals("clear");
+        if (uuid == null || !NAME_PATTERN.matcher(name).matches() || !GROUP_PATTERN.matcher(group).matches()
+                || idNeeded && !UUID_PATTERN.matcher(id).matches()
+                || !action.equals("put") && !action.equals("remove") && !action.equals("clear")) {
+            respond(ex, 400, "bad request", "text/plain");
+            return;
+        }
+        StoredMarker marker = null;
+        if (action.equals("put")) {
+            String dim = json.getOrDefault("dim", ""), type = json.getOrDefault("type", "");
+            String x = json.getOrDefault("x", ""), y = json.getOrDefault("y", ""), z = json.getOrDefault("z", "");
+            if (!DIM_PATTERN.matcher(dim).matches() || !TYPE_PATTERN.matcher(type).matches()
+                    || !INT_PATTERN.matcher(x).matches() || !INT_PATTERN.matcher(y).matches() || !INT_PATTERN.matcher(z).matches()) {
+                respond(ex, 400, "bad request", "text/plain");
+                return;
+            }
+            marker = new StoredMarker(id, dim, Integer.parseInt(x), Integer.parseInt(y), Integer.parseInt(z), type, name,
+                    System.currentTimeMillis());
+        }
+        if (authorize(name, json.getOrDefault("serverId", ""), uuid, json.getOrDefault("token", "")) == Auth.DENIED) {
+            respond(ex, 401, "not authenticated", "text/plain");
+            return;
+        }
+        synchronized (MARKERS) {
+            expireMarkers();
+            LinkedHashMap<String, StoredMarker> markers = MARKERS.get(group);
+            if (markers == null) {
+                if (marker == null) { // nothing to remove
+                    respond(ex, 204, "", "text/plain");
+                    return;
+                }
+                if (MARKERS.size() >= MAX_GROUPS) {
+                    respond(ex, 503, "full", "text/plain");
+                    return;
+                }
+                MARKERS.put(group, markers = new LinkedHashMap<>());
+            }
+            StoredMarker existing = idNeeded ? markers.get(id) : null;
+            if (existing != null && !existing.owner().equalsIgnoreCase(name)) {
+                respond(ex, 403, "not your marker", "text/plain");
+                return;
+            }
+            switch (action) {
+                case "clear" -> markers.values().removeIf(m -> m.owner().equalsIgnoreCase(name));
+                case "remove" -> markers.remove(id);
+                default -> {
+                    markers.remove(id); // added again at the end: it is the newest now
+                    trimMarkers(markers, name, MAX_MARKERS_PER_OWNER - 1);
+                    trimMarkers(markers, null, MAX_MARKERS_PER_GROUP - 1);
+                    markers.put(id, marker);
+                }
+            }
+            if (markers.isEmpty()) MARKERS.remove(group);
+        }
+        respond(ex, 204, "", "text/plain");
+    }
+
+    /** Drops the oldest markers (of {@code owner}, or anyone's if null) until at most {@code keep} of them are left. */
+    private static void trimMarkers(LinkedHashMap<String, StoredMarker> markers, String owner, int keep) {
+        long count = markers.values().stream().filter(m -> owner == null || m.owner().equalsIgnoreCase(owner)).count();
+        for (var it = markers.values().iterator(); count > keep && it.hasNext(); ) {
+            StoredMarker m = it.next();
+            if (owner == null || m.owner().equalsIgnoreCase(owner)) {
+                it.remove();
+                count--;
+            }
+        }
+    }
+
+    /** Forgets markers nobody re-sent for MARKER_TTL_MS. Call while holding MARKERS. */
+    private static void expireMarkers() {
+        long cutoff = System.currentTimeMillis() - MARKER_TTL_MS;
+        MARKERS.values().removeIf(markers -> {
+            markers.values().removeIf(m -> m.time() < cutoff);
+            return markers.isEmpty();
+        });
     }
 
     private static void handleCustom(HttpExchange ex) throws IOException {
