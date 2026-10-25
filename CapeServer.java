@@ -35,9 +35,9 @@ import java.util.regex.Pattern;
  *   POST /capes  {"uuid":"..","name":"..","serverId":"..","token":"..","cosmetic":"<id>.<id>..."}  -> 204, or 400/401
  *   POST /custom?uuid=..&name=..&serverId=..&token=..   body: cape texture PNG  -> 200 "<hash>", or 400/401/413
  *   GET  /custom/<hash>.png  (or HEAD)  -> the PNG, or 404
- *   GET  /markers?group=<64 hex>  -> [{"id":"..","dim":"..","x":..,"y":..,"z":..,"type":"..","owner":".."}, ...]
+ *   GET  /markers?group=<64 hex>  -> [{"id":"..","dim":"..","x":..,"y":..,"z":..,"tx":..,"tz":..,"type":"..","owner":".."}, ...]
  *   POST /markers  {"uuid","name","serverId","token","group","action":"put|remove|clear",
- *                   "id","dim","x","y","z","type"}  -> 204, or 400/401/403
+ *                   "id","dim","x","y","z","tx","tz","type"}  -> 204, or 400/401/403  (tx/tz optional)
  *   GET  /health -> ok
  *
  * Custom capes are pictures players made into capes. They are stored by the first 16 hex digits of
@@ -90,11 +90,12 @@ public class CapeServer {
     /** group -> marker id -> marker, oldest first; guarded by itself */
     private static final Map<String, LinkedHashMap<String, StoredMarker>> MARKERS = new LinkedHashMap<>();
 
-    private record StoredMarker(String id, String dim, int x, int y, int z, String type, String owner, long time) {
+    /** (tx, tz): where an attack arrow points; the marker's own spot for other kinds */
+    private record StoredMarker(String id, String dim, int x, int y, int z, int tx, int tz, String type, String owner, long time) {
         String toJson() {
             // every field was checked against a pattern, so nothing needs escaping
             return "{\"id\":\"" + id + "\",\"dim\":\"" + dim + "\",\"x\":" + x + ",\"y\":" + y + ",\"z\":" + z
-                    + ",\"type\":\"" + type + "\",\"owner\":\"" + owner + "\"}";
+                    + ",\"tx\":" + tx + ",\"tz\":" + tz + ",\"type\":\"" + type + "\",\"owner\":\"" + owner + "\"}";
         }
     }
     /** uuid (or lowercase name, for offline players) -> hash of that player's custom cape picture */
@@ -279,13 +280,16 @@ public class CapeServer {
         if (action.equals("put")) {
             String dim = json.getOrDefault("dim", ""), type = json.getOrDefault("type", "");
             String x = json.getOrDefault("x", ""), y = json.getOrDefault("y", ""), z = json.getOrDefault("z", "");
+            // older mods send no target: the marker points at itself
+            String tx = json.getOrDefault("tx", x), tz = json.getOrDefault("tz", z);
             if (!DIM_PATTERN.matcher(dim).matches() || !TYPE_PATTERN.matcher(type).matches()
-                    || !INT_PATTERN.matcher(x).matches() || !INT_PATTERN.matcher(y).matches() || !INT_PATTERN.matcher(z).matches()) {
+                    || !INT_PATTERN.matcher(x).matches() || !INT_PATTERN.matcher(y).matches() || !INT_PATTERN.matcher(z).matches()
+                    || !INT_PATTERN.matcher(tx).matches() || !INT_PATTERN.matcher(tz).matches()) {
                 respond(ex, 400, "bad request", "text/plain");
                 return;
             }
-            marker = new StoredMarker(id, dim, Integer.parseInt(x), Integer.parseInt(y), Integer.parseInt(z), type, name,
-                    System.currentTimeMillis());
+            marker = new StoredMarker(id, dim, Integer.parseInt(x), Integer.parseInt(y), Integer.parseInt(z),
+                    Integer.parseInt(tx), Integer.parseInt(tz), type, name, System.currentTimeMillis());
         }
         if (authorize(name, json.getOrDefault("serverId", ""), uuid, json.getOrDefault("token", "")) == Auth.DENIED) {
             respond(ex, 401, "not authenticated", "text/plain");
