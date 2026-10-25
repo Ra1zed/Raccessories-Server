@@ -59,14 +59,19 @@ import java.util.regex.Pattern;
  * Map markers: on Minecraft servers without the mod, players share world map markers with their scoreboard
  * team through here. A "group" is a hash the clients make from the server address and the team name, so this
  * server never learns either. Markers are kept in memory only, for MARKER_TTL_MS after their last upload; players
- * re-send theirs when they notice they are gone. Uploads are authenticated like capes, so the owner name shown to
- * the team is real, and only the owner can move or remove a marker.
+ * re-send theirs when they notice they are gone. Uploads are authenticated like capes, and only the player who placed
+ * a marker can move or remove it: a Mojang-checked player is known by their uuid, anyone else by their token.
+ * Cracked players are let in even when their name is claimed by someone else here (a premium player, another
+ * install) or isn't a premium-style name (offline servers allow any name): offline-mode servers let anyone join under
+ * any name anyway, and a team's markers are only seen by those who know its group.
  */
 public class CapeServer {
     private static final Pattern UUID_PATTERN = Pattern.compile("^[0-9a-f]{32}$");
     // a loadout: up to 256 chars of cosmetic ids joined with '.' (one id per slot: back, head, body, legs, effect)
     private static final Pattern COSMETIC_PATTERN = Pattern.compile("^(?=.{0,256}$)([a-z0-9_]{1,64}([.][a-z0-9_]{1,64})*)?$");
     private static final Pattern NAME_PATTERN = Pattern.compile("^[A-Za-z0-9_]{1,16}$");
+    /** marker owners: any name an offline-mode server allows, without what would need escaping in JSON */
+    private static final Pattern MARKER_NAME_PATTERN = Pattern.compile("^[^\\s\"\\\\\\p{Cntrl}]{1,16}$");
     private static final Pattern TOKEN_PATTERN = Pattern.compile("^[0-9a-f]{32,64}$");
     /** In NAME_TOKENS: the name's premium owner uploaded, so offline uploads can't use it. */
     private static final String PREMIUM = "premium";
@@ -95,8 +100,9 @@ public class CapeServer {
 
     /** (tx, tz): where an attack arrow points; the marker's own spot for other kinds. icon: what it marks, or "" */
     /** expires: when a temporary marker disappears (epoch ms), 0 for one that stays */
+    /** ownerKey: who placed it, see markerOwner (not sent to clients) */
     private record StoredMarker(String id, String dim, int x, int y, int z, int tx, int tz, String type, String owner,
-                                String icon, long expires, long time) {
+                                String ownerKey, String icon, long expires, long time) {
         String toJson() {
             // every field was checked against a pattern, so nothing needs escaping
             return "{\"id\":\"" + id + "\",\"dim\":\"" + dim + "\",\"x\":" + x + ",\"y\":" + y + ",\"z\":" + z
@@ -277,10 +283,15 @@ public class CapeServer {
         String action = json.getOrDefault("action", "");
         String id = json.getOrDefault("id", "");
         boolean idNeeded = !action.equals("clear");
-        if (uuid == null || !NAME_PATTERN.matcher(name).matches() || !GROUP_PATTERN.matcher(group).matches()
+        if (uuid == null || !MARKER_NAME_PATTERN.matcher(name).matches() || !GROUP_PATTERN.matcher(group).matches()
                 || idNeeded && !UUID_PATTERN.matcher(id).matches()
                 || !action.equals("put") && !action.equals("remove") && !action.equals("clear")) {
             respond(ex, 400, "bad request", "text/plain");
+            return;
+        }
+        String owner = markerOwner(name, json.getOrDefault("serverId", ""), uuid, json.getOrDefault("token", ""));
+        if (owner == null) {
+            respond(ex, 401, "not authenticated", "text/plain");
             return;
         }
         StoredMarker marker = null;
@@ -300,11 +311,7 @@ public class CapeServer {
                 return;
             }
             marker = new StoredMarker(id, dim, Integer.parseInt(x), Integer.parseInt(y), Integer.parseInt(z),
-                    Integer.parseInt(tx), Integer.parseInt(tz), type, name, icon, Long.parseLong(expires), System.currentTimeMillis());
-        }
-        if (authorize(name, json.getOrDefault("serverId", ""), uuid, json.getOrDefault("token", "")) == Auth.DENIED) {
-            respond(ex, 401, "not authenticated", "text/plain");
-            return;
+                    Integer.parseInt(tx), Integer.parseInt(tz), type, name, owner, icon, Long.parseLong(expires), System.currentTimeMillis());
         }
         synchronized (MARKERS) {
             expireMarkers();
@@ -321,16 +328,16 @@ public class CapeServer {
                 MARKERS.put(group, markers = new LinkedHashMap<>());
             }
             StoredMarker existing = idNeeded ? markers.get(id) : null;
-            if (existing != null && !existing.owner().equalsIgnoreCase(name)) {
+            if (existing != null && !existing.ownerKey().equals(owner)) {
                 respond(ex, 403, "not your marker", "text/plain");
                 return;
             }
             switch (action) {
-                case "clear" -> markers.values().removeIf(m -> m.owner().equalsIgnoreCase(name));
+                case "clear" -> markers.values().removeIf(m -> m.ownerKey().equals(owner));
                 case "remove" -> markers.remove(id);
                 default -> {
                     markers.remove(id); // added again at the end: it is the newest now
-                    trimMarkers(markers, name, MAX_MARKERS_PER_OWNER - 1);
+                    trimMarkers(markers, owner, MAX_MARKERS_PER_OWNER - 1);
                     trimMarkers(markers, null, MAX_MARKERS_PER_GROUP - 1);
                     markers.put(id, marker);
                 }
@@ -340,12 +347,12 @@ public class CapeServer {
         respond(ex, 204, "", "text/plain");
     }
 
-    /** Drops the oldest markers (of {@code owner}, or anyone's if null) until at most {@code keep} of them are left. */
-    private static void trimMarkers(LinkedHashMap<String, StoredMarker> markers, String owner, int keep) {
-        long count = markers.values().stream().filter(m -> owner == null || m.owner().equalsIgnoreCase(owner)).count();
+    /** Drops the oldest markers (of {@code ownerKey}, or anyone's if null) until at most {@code keep} of them are left. */
+    private static void trimMarkers(LinkedHashMap<String, StoredMarker> markers, String ownerKey, int keep) {
+        long count = markers.values().stream().filter(m -> ownerKey == null || m.ownerKey().equals(ownerKey)).count();
         for (var it = markers.values().iterator(); count > keep && it.hasNext(); ) {
             StoredMarker m = it.next();
-            if (owner == null || m.owner().equalsIgnoreCase(owner)) {
+            if (ownerKey == null || m.ownerKey().equals(ownerKey)) {
                 it.remove();
                 count--;
             }
@@ -501,6 +508,20 @@ public class CapeServer {
             return Auth.OFFLINE;
         }
         return claimed.equals(tokenHash) ? Auth.OFFLINE : Auth.DENIED;
+    }
+
+    /**
+     * Who is changing markers: "uuid:.." when Mojang confirmed the player (or with --no-auth), else "token:<hash>" for
+     * anyone with a well-formed token, whether or not they may use the name for capes; null without either.
+     */
+    private static String markerOwner(String name, String serverId, String uuid, String token) throws IOException, InterruptedException {
+        // a premium-style name goes through the usual check, so a premium player claims their name here too
+        boolean premium = NAME_PATTERN.matcher(name).matches()
+                ? authorize(name, serverId, uuid, token) == Auth.PREMIUM
+                : !requireAuth || verifyWithMojang(name, serverId, uuid);
+        if (premium)
+            return "uuid:" + uuid;
+        return TOKEN_PATTERN.matcher(token).matches() ? "token:" + sha256(token.getBytes(StandardCharsets.UTF_8)) : null;
     }
 
     /** Asks Mojang whether this player really just called joinServer with this serverId. */
